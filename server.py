@@ -4,6 +4,7 @@ import json
 from datetime import timezone, datetime
 import threading
 import secrets
+import time
 
 
 class Logger:
@@ -40,11 +41,18 @@ class Logger:
 class Server:
     SERVER_IP = "127.0.0.1"
     SERVER_PORT = 5500
-    SENSOR_TYPES = ("ThermoNode", "WindSense", "RainDetect", "AirQuality")
+    SENSOR_FIELDS = {
+        "ThermoNode": ("temperature", "humidity", "dew_point", "pressure"),
+        "WindSense": ("wind_speed", "wind_gust", "wind_direction", "turbulence"),
+        "RainDetect": ("rainfall", "soil_moisture", "flood_risk", "rain_duration"),
+        "AirQuality": ("co2", "ozone", "air_quality_index"),
+    }
 
     def __init__(self, serverIP = SERVER_IP, serverPort = SERVER_PORT):
         self.socket =socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.logger = Logger("server.log")
+        self.lock = threading.Lock()
+        self.running = False
         self.sequence = 0
         self.sessions = {}
 
@@ -67,8 +75,16 @@ class Server:
                 raise error
 
     def nextSequenceNumber(self):
-        self.sequence += 1
-        return self.sequence
+        with self.lock:
+            self.sequence += 1
+            return self.sequence
+
+    def start(self):
+        self.running = True
+        self.logger.system("INFO", "SERVER", f"Server listening on {self.ip}:{self.port}")
+        threading.Thread(target=self.run, daemon=True).start()
+
+
 
 
     def send(self, message, destinationAddress):
@@ -87,9 +103,13 @@ class Server:
             return None, address
 
     def run(self):
-        self.logger.system("INFO", "SERVER", f"Server is listening on {self.ip}:{self.port}")
         while True:
-            message, address = self.receive()
+            try:
+                message, address = self.receive()
+            except OSError:
+                if not self.running:
+                    break
+                continue
             if message is None:
                 self.logger.system("WARNING", "SERVER", f"Invalid message from {address}")
                 continue
@@ -110,21 +130,50 @@ class Server:
     def handleReg(self, message, address):
         sensorType = message.get("sensorType")
         sensorId = message.get("sensorId")
-        if sensorType not in self.SENSOR_TYPES or not sensorId:
+        if sensorType not in self.SENSOR_FIELDS or not sensorId:
             self.reply({"type": "REJECT", "ack-for": message.get("sequence"), "reason": "Invalid sensor"}, address)
             return
-        for session in self.sessions.values():
-            if session["sensorType"] == sensorType and session["sensorId"] == sensorId:
-                self.reply({"type": "REJECT", "ack-for": message.get("sequence"), "reason": "Already registered"},
-                           address)
-                return
-        token = secrets.token_hex(6)
-        self.sessions[token] = {"sensorType": message["sensorType"], "sensorId": message["sensorId"], "address": address}
+        with self.lock:
+            duplicate = any(s["sensorType"] == sensorType and s["sensorId"] == sensorId
+                            for s in self.sessions.values())
+            if not duplicate:
+                token = secrets.token_hex(6)
+                self.sessions[token] = {"sensorType": sensorType, "sensorId": sensorId,
+                                        "address": address, "lastData": time.monotonic()}
+        if duplicate:
+            self.reply({"type": "REJECT", "ack-for": message.get("sequence"), "reason": "Already registered"}, address)
+            return
+        self.logger.system("INFO", "SERVER", f"Sensor registered: {sensorType}:{sensorId}, token {token}")
+
+
         return self.reply({"type": "ACK", "ack-for": message["sequence"], "token": token }, address)
 
     def handleData(self, message, address):
-        if message.get("token") not in self.sessions:
-            self.reply({"type": "REJECT", "ack-for": message.get("sequence"), "reason": "Invalid token"}, address)
+       sequence = message.get("sequence")
+       with self.lock:
+           session = self.sessions.get(message.get("token"))
+
+       if session is None:
+           self.reply({"type": "REJECT", "ack-for": sequence, "reason": "Invalid token"}, address)
+           return
+
+
+       if message.get("sensorId") != session["sensorId"]:
+           self.reply({"type": "REJECT", "ack-for": sequence, "reason": "token doesn't match sensor Id"}, address)
+           return
+
+       fields = self.SENSOR_FIELDS[session["sensorType"]]
+       if any(field not in message for field in fields):
+           self.reply({"type": "REJECT", "ack-for": sequence, "reason": "Missing values"}, address)
+           return
+
+       with self.lock:
+           session["lastData"] = time.monotonic()
+           session["address"] = address
+       values = {field: message[field] for field in fields}
+       print(f"[DATA] {session['sensorType']}:{session['sensorId']} {values}")
+       self.reply({"type": "ACK", "ack-for": sequence}, address)
+
 
     def reply(self, message, address):
         message["sequence"] = self.nextSequenceNumber()
@@ -133,14 +182,20 @@ class Server:
 
 
     def close(self):
-         self.socket.close()
+        self.running = False
+        self.socket.close()
+        self.logger.system("INFO", "SERVER", "Server stopped")
 
 
 
 
 def main():
     server = Server()
-    server.run()
+    server.start()
+    print(f"Server listening on {server.ip}:{server.port}. Press Enter to stop.")
+    input()
+    server.close()
+
 
 if __name__ == "__main__":
     main()
