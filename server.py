@@ -8,9 +8,10 @@ import time
 
 
 class Logger:
-    def __init__(self, filename):
+    def __init__(self, filename, console=False):
         self.filename = filename
         self.lock = threading.Lock()
+        self.console = console
 
     def _getTime(self):
         now = datetime.now(timezone.utc)
@@ -24,6 +25,8 @@ class Logger:
                     f.write(line + "\n")
             except OSError:
                 pass
+            if self.console:
+                print(line)
 
 
 
@@ -39,7 +42,7 @@ class Logger:
 
 
 class Server:
-    SERVER_IP = "127.0.0.1"
+    SERVER_IP = "0.0.0.0"
     SERVER_PORT = 5500
     SENSOR_FIELDS = {
         "ThermoNode": ("temperature", "humidity", "dew_point", "pressure"),
@@ -48,9 +51,9 @@ class Server:
         "AirQuality": ("co2", "ozone", "air_quality_index"),
     }
 
-    def __init__(self, serverIP = SERVER_IP, serverPort = SERVER_PORT):
+    def __init__(self, logger, serverIP = SERVER_IP, serverPort = SERVER_PORT):
         self.socket =socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.logger = Logger("server.log")
+        self.logger = logger
         self.lock = threading.Lock()
         self.running = False
         self.sequence = 0
@@ -63,16 +66,13 @@ class Server:
             raise ValueError(f"Invalid IP address: {serverIP}")
 
         try:
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.bind((self.ip, serverPort))
             self.port = serverPort
         except OSError as error :
-
-            if error.errno in (48, 98, 10048):
+            self.socket.close()
+            if error.errno in (48, 98, 10048, 10013):
                 raise ConnectionError(f"port{serverPort} is already occupied") from error
-            else:
-                self.socket.close()
-                raise error
+            raise ConnectionError(f"cannot bind {serverIP}:{serverPort} ({error})") from error
 
     def nextSequenceNumber(self):
         with self.lock:
@@ -81,8 +81,10 @@ class Server:
 
     def start(self):
         self.running = True
+        self.socket.settimeout(0.5)
         self.logger.system("INFO", "SERVER", f"Server listening on {self.ip}:{self.port}")
-        threading.Thread(target=self.run, daemon=True).start()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
 
 
 
@@ -103,9 +105,11 @@ class Server:
             return None, address
 
     def run(self):
-        while True:
+        while self.running:
             try:
                 message, address = self.receive()
+            except socket.timeout:
+                continue
             except OSError:
                 if not self.running:
                     break
@@ -114,7 +118,10 @@ class Server:
                 self.logger.system("WARNING", "SERVER", f"Invalid message from {address}")
                 continue
             self.logger.message("SERVER", "Received", message)
-            self.handleMessage(message, address)
+            try:
+                self.handleMessage(message, address)
+            except Exception as error:
+                self.logger.system("ERROR", "SERVER", f"Cannot process message from {address}: {error}")
 
 
 
@@ -139,14 +146,14 @@ class Server:
             if not duplicate:
                 token = secrets.token_hex(6)
                 self.sessions[token] = {"sensorType": sensorType, "sensorId": sensorId,
-                                        "address": address, "lastData": time.monotonic()}
+                                        "address": address, "lastData": time.monotonic(), "lastValues": None}
         if duplicate:
             self.reply({"type": "REJECT", "ack-for": message.get("sequence"), "reason": "Already registered"}, address)
             return
         self.logger.system("INFO", "SERVER", f"Sensor registered: {sensorType}:{sensorId}, token {token}")
 
 
-        return self.reply({"type": "ACK", "ack-for": message["sequence"], "token": token }, address)
+        return self.reply({"type": "ACK", "ack-for": message.get("sequence"), "token": token }, address)
 
     def handleData(self, message, address):
        sequence = message.get("sequence")
@@ -167,34 +174,137 @@ class Server:
            self.reply({"type": "REJECT", "ack-for": sequence, "reason": "Missing values"}, address)
            return
 
+       values = {field: message[field] for field in fields}
        with self.lock:
            session["lastData"] = time.monotonic()
            session["address"] = address
-       values = {field: message[field] for field in fields}
-       print(f"[DATA] {session['sensorType']}:{session['sensorId']} {values}")
+           session["lastValues"] = values
        self.reply({"type": "ACK", "ack-for": sequence}, address)
 
 
     def reply(self, message, address):
-        message["sequence"] = self.nextSequenceNumber()
-        self.send(message, address)
-        self.logger.message("SERVER", "Sent", message)
+        try:
+            message["sequence"] = self.nextSequenceNumber()
+            self.send(message, address)
+            self.logger.message("SERVER", "Sent", message)
+        except OSError as error:
+            self.logger.system("ERROR", "SERVER", f"Send to {address} failed: {error}")
+
+    def sessionList(self):
+        with self.lock:
+            return list(dict(s) for s in self.sessions.values())
 
 
     def close(self):
         self.running = False
+        self.thread.join(timeout=2)
         self.socket.close()
         self.logger.system("INFO", "SERVER", "Server stopped")
 
 
+def askIP(prompt, default):
+    while True:
+        text = input(f"{prompt} [{default}]: ").strip() or default
+        try:
+            ipaddress.ip_address(text)
+            return text
+        except ValueError:
+            print("Invalid IP address, try again (example: 192.168.1.15).")
+
+
+def askPort(prompt, default):
+    while True:
+        text = input(f"{prompt} [{default}]: ").strip() or str(default)
+        if text.isdigit() and 1024 <= int(text) <= 65535:
+            return int(text)
+        print("Port must be a number between 1024 and 65535.")
+
+
+def showSensors(server):
+    sessions = server.sessionList()
+    if not sessions:
+        print("No registered sensors.")
+        return
+    now = time.monotonic()
+    for s in sessions:
+        ago = now - s["lastData"]
+        values = s["lastValues"] if s["lastValues"] is not None else "no data yet"
+        print(f"  {s['sensorType']}:{s['sensorId']}  {s['address'][0]}:{s['address'][1]}  "
+              f"last data {ago:.0f}s ago  {values}")
+
 
 
 def main():
-    server = Server()
-    server.start()
-    print(f"Server listening on {server.ip}:{server.port}. Press Enter to stop.")
-    input()
-    server.close()
+    logger = Logger("server.log")
+    ip = Server.SERVER_IP
+    port = Server.SERVER_PORT
+    server = None
+
+    while True:
+        state = f"LISTENING on {server.ip}:{server.port}" if server else f"STOPPED (settings {ip}:{port})"
+        print(f"\n=== SERVER - {state} ===")
+        print("1) Set IP and port")
+        print("2) Start listening")
+        print("3) Show sensors and latest data")
+        print(f"4) Console logging: {'ON' if logger.console else 'OFF'} (toggle)")
+        print("5) Stop listening")
+        print("0) Exit")
+
+        try:
+            choice = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = "0"
+
+        try:
+            match(int(choice) if choice.isdigit() else -1):
+                case 1:
+                   if server:
+                     print("Stop listening first (option 5).")
+                     continue
+                   ip = askIP("Server IP (0.0.0.0 = all interfaces)", ip)
+                   port = askPort("Server port", port)
+
+                case 2:
+                    if server:
+                        print("Already listening.")
+                        continue
+                    try:
+                        server = Server(logger, ip, port)
+                    except (ValueError, ConnectionError) as error:
+                        print(f"Cannot start: {error}")
+                        logger.system("ERROR", "SERVER", f"Cannot start: {error}")
+                        continue
+                    server.start()
+                    print(f"Listening on {server.ip}:{server.port}")
+
+                case 3:
+                    if server:
+                        showSensors(server)
+                    else:
+                        print("Server is not running.")
+
+                case 4:
+                    logger.console = not logger.console
+                    print(f"Console logging {'ON' if logger.console else 'OFF'}")
+
+                case 5:
+                    if server:
+                        server.close()
+                        server = None
+                    else:
+                        print("Server is not running.")
+
+                case 0:
+                    if server:
+                        server.close()
+                    print("Bye.")
+                    break
+
+                case _:
+                    print("Unknown option.")
+
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
 
 
 if __name__ == "__main__":
