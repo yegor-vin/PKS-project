@@ -5,6 +5,8 @@ from datetime import timezone, datetime
 import threading
 import secrets
 import time
+import zlib
+from collections import deque
 
 
 class Logger:
@@ -28,8 +30,6 @@ class Logger:
             if self.console:
                 print(line)
 
-
-
     def system(self, level, source, text):
         self.log("SYSTEM", level, source, text)
 
@@ -37,8 +37,10 @@ class Logger:
         self.log("MESSAGE", "INFO", source, f"{direction}: {json.dumps(message, separators=(',', ':'))}")
 
 
-
-
+def computeCrc(message):
+    body = {key: value for key, value in message.items() if key != "crc"}
+    data = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return zlib.crc32(data)
 
 
 class Server:
@@ -51,8 +53,8 @@ class Server:
         "AirQuality": ("co2", "ozone", "air_quality_index"),
     }
 
-    def __init__(self, logger, serverIP = SERVER_IP, serverPort = SERVER_PORT):
-        self.socket =socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def __init__(self, logger, serverIP=SERVER_IP, serverPort=SERVER_PORT):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.logger = logger
         self.lock = threading.Lock()
         self.running = False
@@ -68,7 +70,7 @@ class Server:
         try:
             self.socket.bind((self.ip, serverPort))
             self.port = serverPort
-        except OSError as error :
+        except OSError as error:
             self.socket.close()
             if error.errno in (48, 98, 10048, 10013):
                 raise ConnectionError(f"port{serverPort} is already occupied") from error
@@ -85,9 +87,6 @@ class Server:
         self.logger.system("INFO", "SERVER", f"Server listening on {self.ip}:{self.port}")
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
-
-
-
 
     def send(self, message, destinationAddress):
         self.socket.sendto(json.dumps(message).encode("utf-8"), destinationAddress)
@@ -123,16 +122,12 @@ class Server:
             except Exception as error:
                 self.logger.system("ERROR", "SERVER", f"Cannot process message from {address}: {error}")
 
-
-
     def handleMessage(self, message, address):
         mType = message.get("type")
         if mType == "REGISTER":
             self.handleReg(message, address)
         elif mType == "DATA":
             self.handleData(message, address)
-
-
 
     def handleReg(self, message, address):
         sensorType = message.get("sensorType")
@@ -146,41 +141,63 @@ class Server:
             if not duplicate:
                 token = secrets.token_hex(6)
                 self.sessions[token] = {"sensorType": sensorType, "sensorId": sensorId,
-                                        "address": address, "lastData": time.monotonic(), "lastValues": None}
+                                        "address": address, "lastData": time.monotonic(), "lastValues": None,
+                                        "token": token, "SuppressACKs": 0, "recentSequences": deque(maxlen=50)}
         if duplicate:
             self.reply({"type": "REJECT", "ack-for": message.get("sequence"), "reason": "Already registered"}, address)
             return
         self.logger.system("INFO", "SERVER", f"Sensor registered: {sensorType}:{sensorId}, token {token}")
 
-
-        return self.reply({"type": "ACK", "ack-for": message.get("sequence"), "token": token }, address)
+        return self.reply({"type": "ACK", "ack-for": message.get("sequence"), "token": token}, address)
 
     def handleData(self, message, address):
-       sequence = message.get("sequence")
-       with self.lock:
-           session = self.sessions.get(message.get("token"))
+        sequence = message.get("sequence")
+        with self.lock:
+            session = self.sessions.get(message.get("token"))
 
-       if session is None:
-           self.reply({"type": "REJECT", "ack-for": sequence, "reason": "Invalid token"}, address)
-           return
+        if message.get("crc") != computeCrc(message):
+            name = f"{session['sensorType']}:{session['sensorId']}" if session else str(message.get("sensorId"))
+            self.logger.system("WARNING", "SERVER",
+                               f"Integrity check failed for {name} retransmission requested")
+            self.reply({"type": "RETRANSMIT", "ack-for": sequence}, address)
+            return
 
+        if session is None:
+            self.reply({"type": "REJECT", "ack-for": sequence, "reason": "Invalid token"}, address)
+            return
 
-       if message.get("sensorId") != session["sensorId"]:
-           self.reply({"type": "REJECT", "ack-for": sequence, "reason": "token doesn't match sensor Id"}, address)
-           return
+        if message.get("sensorId") != session["sensorId"]:
+            self.reply({"type": "REJECT", "ack-for": sequence, "reason": "token doesn't match sensor Id"}, address)
+            return
 
-       fields = self.SENSOR_FIELDS[session["sensorType"]]
-       if any(field not in message for field in fields):
-           self.reply({"type": "REJECT", "ack-for": sequence, "reason": "Missing values"}, address)
-           return
+        fields = self.SENSOR_FIELDS[session["sensorType"]]
+        if any(field not in message for field in fields):
+            self.reply({"type": "REJECT", "ack-for": sequence, "reason": "Missing values"}, address)
+            return
 
-       values = {field: message[field] for field in fields}
-       with self.lock:
-           session["lastData"] = time.monotonic()
-           session["address"] = address
-           session["lastValues"] = values
-       self.reply({"type": "ACK", "ack-for": sequence}, address)
+        values = {field: message[field] for field in fields}
+        name = f"{session['sensorType']}:{session['sensorId']}"
+        with self.lock:
+            session["lastData"] = time.monotonic()
+            session["address"] = address
+            duplicate = sequence in session["recentSequences"]
+            if not duplicate:
+                session["recentSequences"].append(sequence)
+                session["lastValues"] = values
 
+            suppress = session["suppressACKs"] > 0
+            if suppress:
+                session[("SuppressACKs")] -= 1
+                left = session["SuppressACKs"]
+
+        if duplicate:
+            self.logger.system("INFO", "SERVER", f"Repeated DATA {sequence} from {name} (already stored)")
+        if suppress:
+                self.logger.system("WARNING", "SERVER",
+                                   f"ACK suppressed for {name}, DATA {sequence} ({left} more to suppress)")
+                return
+
+        self.reply({"type": "ACK", "ack-for": sequence}, address)
 
     def reply(self, message, address):
         try:
@@ -194,6 +211,15 @@ class Server:
         with self.lock:
             return list(dict(s) for s in self.sessions.values())
 
+    def suppressAcks(self, token, count):
+        with self.lock:
+            session = self.sessions.get(token)
+            if session is None:
+               return False
+            session["SuppressACKs"] = count
+        self.logger.system("INFO", "SERVER",
+                           f"Next {count} DATA message(s) of {session['sensorType']}:{session['sensorId']}" f"will not be acknowledged")
+        return True
 
     def close(self):
         self.running = False
@@ -233,6 +259,27 @@ def showSensors(server):
               f"last data {ago:.0f}s ago  {values}")
 
 
+def chooseSession(server):
+    sessions = server.sessionList()
+    if not sessions:
+        print("No registered sensors.")
+        return None
+    for i, s in enumerate(sessions, 1):
+        print(f"  {i}) {s['sensorType']}:{s['sensorId']}")
+    while True:
+        text = input("Sensor (number): ").strip()
+        if text.isdigit() and 1 <= int(text) <= len(sessions):
+            return sessions[int(text) - 1]
+        print("Choose one of the numbers above.")
+
+
+def askCount(prompt):
+    while True:
+        text = input(prompt).strip()
+        if text.isdigit() and 1 <= int(text) <= 5:
+            return int(text)
+        print("Enter a number between 1 and 5.")
+
 
 def main():
     logger = Logger("server.log")
@@ -248,6 +295,7 @@ def main():
         print("3) Show sensors and latest data")
         print(f"4) Console logging: {'ON' if logger.console else 'OFF'} (toggle)")
         print("5) Stop listening")
+        print("6) Do not ACK the next x DATA messages of a sensor")
         print("0) Exit")
 
         try:
@@ -256,13 +304,13 @@ def main():
             choice = "0"
 
         try:
-            match(int(choice) if choice.isdigit() else -1):
+            match (int(choice) if choice.isdigit() else -1):
                 case 1:
-                   if server:
-                     print("Stop listening first (option 5).")
-                     continue
-                   ip = askIP("Server IP (0.0.0.0 = all interfaces)", ip)
-                   port = askPort("Server port", port)
+                    if server:
+                        print("Stop listening first (option 5).")
+                        continue
+                    ip = askIP("Server IP (0.0.0.0 = all interfaces)", ip)
+                    port = askPort("Server port", port)
 
                 case 2:
                     if server:
@@ -293,16 +341,25 @@ def main():
                         server = None
                     else:
                         print("Server is not running.")
-
+                case 6:
+                    if not server:
+                        print("Server is not running.")
+                        continue
+                    session = chooseSession(server)
+                    if session:
+                        count = askCount("How many DATA messages (incl. repeats) not to ACK (1-20):")
+                        if server.suppressAcks(session["token"], count):
+                            print(f"Next {count} DATA message(s) of {session['sensorType']}:{session['sensorId']} "
+                                  f"will not be acknowledged.")
+                    else:
+                        print("Sensor is no longer registered.")
                 case 0:
                     if server:
                         server.close()
                     print("Bye.")
                     break
-
                 case _:
                     print("Unknown option.")
-
         except (EOFError, KeyboardInterrupt):
             print("\nCancelled.")
 

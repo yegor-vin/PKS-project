@@ -4,6 +4,8 @@ import json
 from datetime import timezone, datetime
 import threading
 import random
+import zlib
+import time
 
 
 class Logger:
@@ -27,12 +29,12 @@ class Logger:
             if self.console:
                 print(line)
 
-
     def system(self, level, source, text):
         self.log("SYSTEM", level, source, text)
 
     def message(self, source, direction, message):
         self.log("MESSAGE", "INFO", source, f"{direction}: {json.dumps(message, separators=(',', ':'))}")
+
 
 sensorSpecification = {
     "ThermoNode": [
@@ -68,13 +70,13 @@ class Sensor:
         self.stop = threading.Event()
         self.token = None
         self.send = True
+        self.corruptNext = False
 
     def getType(self):
         return self.sensorType
 
     def source(self):
         return f"TESTER:{self.sensorType}:{self.sensorId}"
-
 
     def registerMessage(self, sequence):
         return {"type": "REGISTER", "sequence": sequence, "sensorType": self.sensorType, "sensorId": self.sensorId}
@@ -93,18 +95,27 @@ class Sensor:
             values = self.generateValues()
         message = {"type": "DATA", "sequence": sequence, "sensorId": self.sensorId, "token": self.token}
         message.update(values)
+        message["crc"] = computeCrc(message)
         return message
-
 
 
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 5500
-CLIENT_IP = "0.0.0.0"
-CLIENT_PORT = 0
+
+
+def computeCrc(message):
+    body = {key: value for key, value in message.items() if key != "crc"}
+    data = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return zlib.crc32(data)
 
 
 class Client:
-    def __init__(self, clientIP = CLIENT_IP, clientPort = CLIENT_PORT):
+    CLIENT_IP = "0.0.0.0"
+    CLIENT_PORT = 0
+    ACK_TIMEOUT = 3
+    MAX_ATTEMPTS = 3
+
+    def __init__(self, clientIP=CLIENT_IP, clientPort=CLIENT_PORT):
         self.logger = Logger("tester.log")
         self.sensors = {}
         self.server = (SERVER_IP, SERVER_PORT)
@@ -140,8 +151,6 @@ class Client:
         self.server = (serverIp, serverPort)
         self.logger.system("INFO", "TESTER", f"Server address set to {serverIp}:{serverPort}")
 
-
-
     def register(self, sensorType, sensorId):
         if sensorType not in sensorSpecification:
             print("Unknown sensor type")
@@ -160,6 +169,7 @@ class Client:
     def start(self):
         self.running = True
         threading.Thread(target=self.listening, daemon=True).start()
+        threading.Thread(target=self.retransmitLoop, daemon=True).start()
 
     def listening(self):
         while self.running:
@@ -182,9 +192,19 @@ class Client:
             self.logger.message("TESTER", "Received (unexpected)", reply)
             return
 
-        sensor, original = entry
+        sensor, original = entry["sensor"], entry["message"]
         self.logger.message(sensor.source(), "Received", reply)
         replyType = reply.get("type")
+
+        if replyType == "RETRANSMIT":
+            self.logger.system("WARNING", sensor.source(),
+                               f"Server requested retransmission of {original['type']} {original['sequence']}")
+            entry["attempts"] = 1
+            entry["timeSent"] = time.monotonic()
+            with self.lock:
+                self.pending[original["sequence"]] = entry
+            self.transmit(entry, "Retransmitted")
+            return
 
         if original["type"] == "REGISTER":
             if replyType == "ACK" and reply.get("token"):
@@ -205,7 +225,6 @@ class Client:
                 self.logger.system("WARNING", sensor.source(),
                                    f"Data {original['sequence']} rejected: {reply.get('reason')}")
 
-
     def startSending(self, sensor):
         threading.Thread(target=self.sendLoop, args=(sensor,), daemon=True).start()
 
@@ -218,16 +237,66 @@ class Client:
         message = sensor.dataMessage(self.nextSequenceNumber(), values)
         self.sendForSensor(sensor, message)
 
-
     def sendForSensor(self, sensor, message):
+        entry = {"sensor": sensor, "message": message, "attempts": 1, "timeSent": time.monotonic()}
         with self.lock:
-            self.pending[message["sequence"]] = (sensor, message)
+            self.pending[message["sequence"]] = entry
+        self.transmit(entry, "Sent")
+
+    def transmit(self, entry, label):
+        sensor, message = entry["sensor"], entry["message"]
+        wire = message
+        if message["type"] == "DATA" and sensor.corruptNext:
+            sensor.corruptNext = False
+            wire = self.corrupt(sensor, message)
+            label += " (CORRUPTED)"
         try:
-            self.send(message, self.server)
+            self.send(wire, self.server)
         except OSError as error:
             self.logger.system("ERROR", sensor.source(), f"Send failed: {error}")
             return
-        self.logger.message(sensor.source(), "Sent", message)
+
+        self.logger.message(sensor.source(), label, wire)
+
+    def corrupt(self, sensor, message):
+        wire = dict(message)
+        name, low, high, decimals = sensorSpecification[sensor.sensorType][0]
+        wire[name] = round(wire[name] + 1, decimals) if decimals else wire[name] + 1
+        self.logger.system("WARNING", sensor.source(),
+                           f"Error injected into DATA {message['sequence']}: {name} {message[name]} -> {wire[name]}")
+        return wire
+
+    def injectError(self, sensor):
+        sensor.corruptNext = True
+        self.logger.system("INFO", sensor.source(), "Next DATA message will be corrupted")
+
+    def retransmitLoop(self):
+        while self.running:
+            time.sleep(0.1)
+            now = time.monotonic()
+            resend, drop = [], []
+            with self.lock:
+                for sequence, entry in list(self.pending.items()):
+                    if now - entry["timeSent"] < self.ACK_TIMEOUT:
+                        continue
+                    if entry["attempts"] < self.MAX_ATTEMPTS:
+                        entry["attempts"] += 1
+                        entry["timeSent"] = now
+                        resend.append(entry)
+                    else:
+                        del self.pending[sequence]
+                        drop.append(entry)
+            for entry in resend:
+                message = entry["message"]
+                self.logger.system("WARNING", entry["sensor"].source(),
+                                   f"No ACK for {message['type']} {message['sequence']} within {self.ACK_TIMEOUT}s, "
+                                   f"sending again (attempt {entry['attempts']}/{self.MAX_ATTEMPTS})")
+                self.transmit(entry, f"Sent (attempt {entry['attempts']}/{self.MAX_ATTEMPTS})")
+            for entry in drop:
+                message = entry["message"]
+                self.logger.system("WARNING", entry["sensor"].source(),
+                               f"No ACK for {message['type']} {message['sequence']} after "
+                               f"{self.MAX_ATTEMPTS} attempts, message dropped")
 
     def send(self, message, destinationAddress):
         self.socket.sendto(json.dumps(message).encode("utf-8"), destinationAddress)
@@ -244,7 +313,6 @@ class Client:
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None, address
 
-
     def toggleSending(self, sensor):
         sensor.send = not sensor.send
         state = 1 if sensor.send else 0
@@ -255,8 +323,6 @@ class Client:
         with self.lock:
             return list(self.sensors.values())
 
-
-
     def close(self):
         self.running = False
         with self.lock:
@@ -265,16 +331,16 @@ class Client:
         self.socket.close()
 
 
-
 class Cancel(Exception):
     pass
 
 
-def ask( prompt):
+def ask(prompt):
     text = input(prompt).strip()
     if text.lower() == 'q':
         raise Cancel()
     return text
+
 
 def askIP(prompt, default):
     while True:
@@ -311,6 +377,7 @@ def askSensorId():
         if text and len(text) <= 16 and " " not in text:
             return text
         print("ID must be 1-16 characters without spaces.")
+
 
 def chooseSensor(client, onlyRegistered=True):
     sensors = [s for s in client.sensorList() if s.token or not onlyRegistered]
@@ -371,6 +438,7 @@ def main():
         print("5) Turn automatic sending on/off for a sensor")
         print("6) Send custom data")
         print(f"7) Console logging: {'ON' if client.logger.console else 'OFF'} (toggle)")
+        print("8) Corrupt the next DATA message of a sensor")
         print("0) Exit")
         print("(type q in any prompt to cancel)")
 
@@ -380,17 +448,16 @@ def main():
             choice = "0"
 
         try:
-            match(int(choice) if choice.isdigit() else -1):
+            match (int(choice) if choice.isdigit() else -1):
                 case 1:
-                 ip = askIP("Server IP", client.server[0])
-                 port = askPort("Server port", client.server[1])
-                 client.setServer(ip, port)
+                    ip = askIP("Server IP", client.server[0])
+                    port = askPort("Server port", client.server[1])
+                    client.setServer(ip, port)
 
                 case 2:
-                   sensorType = askSensorType()
-                   sensorId = askSensorId()
-                   print(client.register(sensorType, sensorId))
-
+                    sensorType = askSensorType()
+                    sensorId = askSensorId()
+                    print(client.register(sensorType, sensorId))
 
                 case 3:
                     for sensorType, sensorId in (("ThermoNode", "T-01"), ("WindSense", "W-01"),
@@ -406,7 +473,6 @@ def main():
                         state = client.toggleSending(sensor)
                         print(f"{sensor.sensorType}:{sensor.sensorId} sending {state}")
 
-
                 case 6:
                     sensor = chooseSensor(client)
                     if sensor:
@@ -420,6 +486,12 @@ def main():
                 case 7:
                     client.logger.console = not client.logger.console
                     print(f"Console logging {'ON' if client.logger.console else 'OFF'}")
+
+                case 8:
+                    sensor = chooseSensor(client)
+                    if sensor:
+                        client.injectError(sensor)
+                        print(f"Next DATA message of {sensor.sensorType}:{sensor.sensorId} will be corrupted.")
 
                 case 0:
                     client.close()
