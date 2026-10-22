@@ -52,6 +52,9 @@ class Server:
         "RainDetect": ("rainfall", "soil_moisture", "flood_risk", "rain_duration"),
         "AirQuality": ("co2", "ozone", "air_quality_index"),
     }
+    IDLE_TIMEOUT = 15
+    KEEPALIVE_INTERVAL = 5
+    MAX_MISSED_KEEPALIVES = 3
 
     def __init__(self, logger, serverIP=SERVER_IP, serverPort=SERVER_PORT):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -87,6 +90,8 @@ class Server:
         self.logger.system("INFO", "SERVER", f"Server listening on {self.ip}:{self.port}")
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
+        self.keepaliveThread = threading.Thread(target=self.keepaliveLoop, daemon=True)
+        self.keepaliveThread.start()
 
     def send(self, message, destinationAddress):
         self.socket.sendto(json.dumps(message).encode("utf-8"), destinationAddress)
@@ -128,6 +133,8 @@ class Server:
             self.handleReg(message, address)
         elif mType == "DATA":
             self.handleData(message, address)
+        elif mType == "ACK":
+            self.handleAck(message)
 
     def handleReg(self, message, address):
         sensorType = message.get("sensorType")
@@ -142,7 +149,11 @@ class Server:
                 token = secrets.token_hex(6)
                 self.sessions[token] = {"sensorType": sensorType, "sensorId": sensorId,
                                         "address": address, "lastData": time.monotonic(), "lastValues": None,
-                                        "token": token, "SuppressACKs": 0, "recentSequences": deque(maxlen=50)}
+                                        "token": token, "SuppressACKs": 0, "recentSequences": deque(maxlen=50),
+                                        "idle": False,
+                                        "missedKeepalives": 0,
+                                        "nextKeepalive": None,
+                                        "keepaliveSeq": None}
         if duplicate:
             self.reply({"type": "REJECT", "ack-for": message.get("sequence"), "reason": "Already registered"}, address)
             return
@@ -180,16 +191,21 @@ class Server:
         with self.lock:
             session["lastData"] = time.monotonic()
             session["address"] = address
+            wasIdle = session["idle"]
+            session["idle"] = False
+            session["missedKeepalives"] = 0
             duplicate = sequence in session["recentSequences"]
             if not duplicate:
                 session["recentSequences"].append(sequence)
                 session["lastValues"] = values
 
-            suppress = session["suppressACKs"] > 0
+            suppress = session["SuppressACKs"] > 0
             if suppress:
-                session[("SuppressACKs")] -= 1
+                session["SuppressACKs"] -= 1
                 left = session["SuppressACKs"]
 
+        if wasIdle:
+            self.logger.system("INFO", "SERVER", f"SENSOR ACTIVE again: {name}")
         if duplicate:
             self.logger.system("INFO", "SERVER", f"Repeated DATA {sequence} from {name} (already stored)")
         if suppress:
@@ -201,11 +217,61 @@ class Server:
 
     def reply(self, message, address):
         try:
-            message["sequence"] = self.nextSequenceNumber()
+            if "sequence" not in message:
+                message["sequence"] = self.nextSequenceNumber()
             self.send(message, address)
             self.logger.message("SERVER", "Sent", message)
         except OSError as error:
             self.logger.system("ERROR", "SERVER", f"Send to {address} failed: {error}")
+
+
+    def handleAck(self, message):
+        with self.lock:
+            session = self.sessions.get(message.get("token"))
+            if session is None or message.get("ack-for") != session["keepaliveSeq"]:
+                return
+            session["missedKeepalives"] = 0
+        self.logger.system("INFO", "SERVER",
+                           f"KEEPALIVE answered by {session['sensorType']}:{session['sensorId']}")
+
+
+    def keepaliveLoop(self):
+        while self.running:
+            time.sleep(0.1)
+            now = time.monotonic()
+            actions = []
+            with self.lock:
+                for token, session in list(self.sessions.items()):
+                    if not session["idle"]:
+                        if now - session["lastData"] < self.IDLE_TIMEOUT:
+                            continue
+                        session["idle"] = True
+                        session["missedKeepalives"] = 0
+                        session["nextKeepalive"] = session["lastData"] + self.IDLE_TIMEOUT
+                        actions.append(("idle", session))
+                    if now < session["nextKeepalive"]:
+                        continue
+                    if session["missedKeepalives"] >= self.MAX_MISSED_KEEPALIVES:
+                        del self.sessions[token]
+                        actions.append(("disconnect", session))
+                    else:
+                        session["missedKeepalives"] += 1
+                        session["nextKeepalive"] += self.KEEPALIVE_INTERVAL
+                        actions.append(("keepalive", session))
+
+            for action, session in actions:
+                name = f"{session['sensorType']}:{session['sensorId']}"
+                if action == "idle":
+                    self.logger.system("INFO", "SERVER", f"SENSOR IDLE: {name}")
+                elif action == "disconnect":
+                    self.logger.system("WARNING", "SERVER", f"SENSOR DISCONNECTED: {name}")
+                else:
+                    sequence = self.nextSequenceNumber()
+                    with self.lock:
+                        session["keepaliveSeq"] = sequence
+                    self.reply({"type": "KEEPALIVE", "sequence": sequence,
+                                "sensorId": session["sensorId"], "token": session["token"]},
+                               session["address"])
 
     def sessionList(self):
         with self.lock:
@@ -224,6 +290,7 @@ class Server:
     def close(self):
         self.running = False
         self.thread.join(timeout=2)
+        self.keepaliveThread.join(timeout=2)      
         self.socket.close()
         self.logger.system("INFO", "SERVER", "Server stopped")
 
@@ -255,7 +322,8 @@ def showSensors(server):
     for s in sessions:
         ago = now - s["lastData"]
         values = s["lastValues"] if s["lastValues"] is not None else "no data yet"
-        print(f"  {s['sensorType']}:{s['sensorId']}  {s['address'][0]}:{s['address'][1]}  "
+        state = "IDLE" if s["idle"] else "active"
+        print(f"  {s['sensorType']}:{s['sensorId']}  {s['address'][0]}:{s['address'][1]}  {state}  "  
               f"last data {ago:.0f}s ago  {values}")
 
 

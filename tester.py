@@ -71,6 +71,8 @@ class Sensor:
         self.token = None
         self.send = True
         self.corruptNext = False
+        self.lastHeard = None
+        self.ended = False
 
     def getType(self):
         return self.sensorType
@@ -114,6 +116,7 @@ class Client:
     CLIENT_PORT = 0
     ACK_TIMEOUT = 3
     MAX_ATTEMPTS = 3
+    SESSION_TIMEOUT = 30
 
     def __init__(self, clientIP=CLIENT_IP, clientPort=CLIENT_PORT):
         self.logger = Logger("tester.log")
@@ -170,6 +173,7 @@ class Client:
         self.running = True
         threading.Thread(target=self.listening, daemon=True).start()
         threading.Thread(target=self.retransmitLoop, daemon=True).start()
+        threading.Thread(target=self.sessionTimerLoop, daemon=True).start()
 
     def listening(self):
         while self.running:
@@ -186,6 +190,9 @@ class Client:
             self.handleReply(reply)
 
     def handleReply(self, reply):
+        if reply.get("type") == "KEEPALIVE":
+            self.handleKeepalive(reply)
+            return
         with self.lock:
             entry = self.pending.pop(reply.get("ack-for"), None)
         if entry is None:
@@ -193,6 +200,7 @@ class Client:
             return
 
         sensor, original = entry["sensor"], entry["message"]
+        sensor.lastHeard = time.monotonic()
         self.logger.message(sensor.source(), "Received", reply)
         replyType = reply.get("type")
 
@@ -209,6 +217,7 @@ class Client:
         if original["type"] == "REGISTER":
             if replyType == "ACK" and reply.get("token"):
                 sensor.token = reply["token"]
+                sensor.lastHeard = time.monotonic()
                 self.logger.system("INFO", sensor.source(), f"Registered, token {sensor.token}")
                 self.startSending(sensor)
 
@@ -224,6 +233,8 @@ class Client:
             else:
                 self.logger.system("WARNING", sensor.source(),
                                    f"Data {original['sequence']} rejected: {reply.get('reason')}")
+                if reply.get("reason") == "Invalid token":
+                    self.endSession(sensor, "server does not know the token any more")
 
     def startSending(self, sensor):
         threading.Thread(target=self.sendLoop, args=(sensor,), daemon=True).start()
@@ -318,6 +329,47 @@ class Client:
         state = 1 if sensor.send else 0
         self.logger.system("INFO", sensor.source(), f"Automatic sending {state}")
         return state
+
+
+    def handleKeepalive(self, keepalive):
+        token = keepalive.get("token")
+        with self.lock:
+            sensor = next((s for s in self.sensors.values() if token and s.token == token), None)
+        if sensor is None:
+            self.logger.message("TESTER", "Received (no active session, not answered)", keepalive)
+            return
+        sensor.lastHeard = time.monotonic()
+        self.logger.message(sensor.source(), "Received", keepalive)
+        ack = {"type": "ACK", "sequence": self.nextSequenceNumber(), "ack-for": keepalive.get("sequence"),
+               "sensorId": sensor.sensorId, "token": sensor.token}
+        try:
+            self.send(ack, self.server)
+        except OSError as error:
+            self.logger.system("ERROR", sensor.source(), f"Send failed: {error}")
+            return
+        self.logger.message(sensor.source(), "Sent", ack)
+
+
+    def endSession(self, sensor, reason):
+        with self.lock:
+            if sensor.token is None:
+                return
+            sensor.token = None
+            sensor.ended = True
+            for sequence, entry in list(self.pending.items()):
+                if entry["sensor"] is sensor:
+                    del self.pending[sequence]
+        sensor.stop.set()
+        self.logger.system("WARNING", sensor.source(), f"Session ended ({reason})")
+
+    def sessionTimerLoop(self):
+        while self.running:
+            time.sleep(0.5)
+            now = time.monotonic()
+            expired = [s for s in self.sensorList()
+                       if s.token and s.lastHeard is not None and now - s.lastHeard > self.SESSION_TIMEOUT]
+            for sensor in expired:
+                self.endSession(sensor, f"no message from the server for {self.SESSION_TIMEOUT} s")
 
     def sensorList(self):
         with self.lock:
@@ -421,7 +473,12 @@ def showSensors(client):
         print("No sensors.")
         return
     for s in sensors:
-        status = f"token {s.token}" if s.token else "waiting for registration ACK"
+        if s.token:
+            status = f"token {s.token}"
+        elif s.ended:
+            status = "session ended (register again with option 2 or 3)"
+        else:
+            status = "waiting for registration ACK"
         print(f"  {s.sensorType}:{s.sensorId}  {status}  sending {'ON' if s.send else 'OFF'}")
 
 
@@ -439,6 +496,7 @@ def main():
         print("6) Send custom data")
         print(f"7) Console logging: {'ON' if client.logger.console else 'OFF'} (toggle)")
         print("8) Corrupt the next DATA message of a sensor")
+        print("9) End the local session of a sensor (disconnect)")
         print("0) Exit")
         print("(type q in any prompt to cancel)")
 
@@ -492,6 +550,15 @@ def main():
                     if sensor:
                         client.injectError(sensor)
                         print(f"Next DATA message of {sensor.sensorType}:{sensor.sensorId} will be corrupted.")
+
+
+                case 9:
+                    sensor = chooseSensor(client)
+                    if sensor:
+                        client.endSession(sensor, "ended by user")
+                        print(f"Session of {sensor.sensorType}:{sensor.sensorId} ended. It stops sending data "
+                              f"and answering KEEPALIVE.")
+
 
                 case 0:
                     client.close()
