@@ -6,6 +6,38 @@ import threading
 import random
 import zlib
 import time
+import math, struct, binascii
+
+TYPES = ["REGISTER", "ACK", "REJECT", "DATA", "RETRANSMIT", "KEEPALIVE"]
+
+SENSOR_TYPES = ["ThermoNode", "WindSense", "RainDetect", "AirQuality"]
+
+REASONS = ["Invalid sensor", "Already registered", "Invalid token",
+           "Token does not match sensor", "Missing values"]
+
+
+def bits_for(low, high, decimals):
+    return math.ceil(math.log2(round((high - low) * 10 ** decimals) + 1))
+
+
+def pack_values(sensorType, values):
+    acc, n = 0, 0
+    for name, low, high, dec in sensorSpecification[sensorType]:
+        w = bits_for(low, high, dec)
+        acc = (acc << w) | round((values[name] - low) * 10 ** dec)
+        n += w
+    pad = (-n) % 8
+    return (acc << pad).to_bytes((n + pad) // 8, "big")
+
+
+def unpack_values(sensorType, data):
+    widths = [bits_for(lo, hi, d) for _, lo, hi, d in sensorSpecification[sensorType]]
+    n = sum(widths); acc = int.from_bytes(data, "big") >> ((-n) % 8)
+    out = {}
+    for (name, low, high, dec), w in zip(reversed(sensorSpecification[sensorType]), reversed(widths)):
+        raw = acc & ((1 << w) - 1); acc >>= w
+        out[name] = round(low + raw / 10 ** dec, dec) if dec else int(low + raw)
+    return dict(reversed(list(out.items())))
 
 
 class Logger:

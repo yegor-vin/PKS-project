@@ -7,6 +7,48 @@ import secrets
 import time
 import zlib
 from collections import deque
+import math, struct, binascii
+
+TYPES = ["REGISTER", "ACK", "REJECT", "DATA", "RETRANSMIT", "KEEPALIVE"]
+
+SENSOR_TYPES = ["ThermoNode", "WindSense", "RainDetect", "AirQuality"]
+
+REASONS = ["Invalid sensor", "Already registered", "Invalid token",
+           "Token does not match sensor", "Missing values"]
+
+sensorSpecification = {
+    "ThermoNode": [("temperature", -50.0, 60.0, 1), ("humidity", 0.0, 100.0, 1),
+                   ("dew_point", -50.0, 60.0, 1), ("pressure", 800.0, 1100.0, 2)],
+    "WindSense": [("wind_speed", 0.0, 50.0, 1), ("wind_gust", 0.0, 70.0, 1),
+                  ("wind_direction", 0, 359, 0), ("turbulence", 0.0, 1.0, 1)],
+    "RainDetect": [("rainfall", 0.0, 500.0, 1), ("soil_moisture", 0.0, 100.0, 1),
+                   ("flood_risk", 0, 3, 0), ("rain_duration", 0, 60, 0)],
+    "AirQuality": [("co2", 300, 5000, 0), ("ozone", 0.0, 500.0, 1), ("air_quality_index", 0, 500, 0)],
+}
+
+
+
+def bits_for(low, high, decimals):
+    return math.ceil(math.log2(round((high - low) * 10 ** decimals) + 1))
+
+
+def pack_values(sensorType, values):
+    acc, n = 0, 0
+    for name, low, high, dec in sensorSpecification[sensorType]:
+        w = bits_for(low, high, dec)
+        acc = (acc << w) | round((values[name] - low) * 10 ** dec)
+        n += w
+    pad = (-n) % 8
+    return (acc << pad).to_bytes((n + pad) // 8, "big")
+
+def unpack_values(sensorType, data):
+    widths = [bits_for(lo, hi, d) for _, lo, hi, d in sensorSpecification[sensorType]]
+    n = sum(widths); acc = int.from_bytes(data, "big") >> ((-n) % 8)
+    out = {}
+    for (name, low, high, dec), w in zip(reversed(sensorSpecification[sensorType]), reversed(widths)):
+        raw = acc & ((1 << w) - 1); acc >>= w
+        out[name] = round(low + raw / 10 ** dec, dec) if dec else int(low + raw)
+    return dict(reversed(list(out.items())))
 
 
 class Logger:
