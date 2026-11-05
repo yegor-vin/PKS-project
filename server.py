@@ -51,6 +51,49 @@ def unpack_values(sensorType, data):
     return dict(reversed(list(out.items())))
 
 
+def encode(m):
+    t = TYPES.index(m["type"])
+    st = SENSOR_TYPES.index(m["sensorType"]) if "sensorType" in m else 0
+    head = struct.pack("!BH", (t << 5) | (st << 3), m["sequence"])
+
+    if m["type"] == "REGISTER":
+        body = struct.pack("!B", m["sensorId"])
+    elif m["type"] in ("ACK", "RETRANSMIT"):
+        body = struct.pack("!H", m["ack-for"]) + (struct.pack("!I", m["token"]) if "token" in m else b"")
+    elif m["type"] == "REJECT":
+        body = struct.pack("!HB", m["ack-for"], REASONS.index(m["reason"]))
+    elif m["type"] == "KEEPALIVE":
+        body = struct.pack("!IB", m["token"], m["sensorId"])
+    else:  # DATA
+        body = struct.pack("!IB", m["token"], m["sensorId"]) + pack_values(m["sensorType"], m)
+    frame = head + body
+    return frame + struct.pack("!H", binascii.crc_hqx(frame, 0xFFFF))  # CRC-16 over everything
+
+
+def decode(data):
+    frame, crc = data[:-2], struct.unpack("!H", data[-2:])[0]
+    t, st = TYPES[data[0] >> 5], SENSOR_TYPES[(data[0] >> 3) & 0b11]
+    m = {"type": t, "sequence": struct.unpack("!H", data[1:3])[0],
+    "crcOk": binascii.crc_hqx(frame, 0xFFFF) == crc}
+    body = frame[3:]
+
+    if t == "REGISTER":
+        m.update(sensorType=st, sensorId=body[0])
+    elif t in ("ACK", "RETRANSMIT"):
+        m["ack-for"] = struct.unpack("!H", body[:2])[0]
+        if len(body) == 6: m["token"] = struct.unpack("!I", body[2:6])[0]
+    elif t == "REJECT":
+        a, r = struct.unpack("!HB", body);
+        m.update({"ack-for": a, "reason": REASONS[r]})
+    elif t == "KEEPALIVE":
+        m["token"], m["sensorId"] = struct.unpack("!IB", body)
+    else:
+        m["token"], m["sensorId"] = struct.unpack("!IB", body[:5])
+        m["sensorType"] = st
+        m.update(unpack_values(st, body[5:]))
+    return m
+
+
 class Logger:
     def __init__(self, filename, console=False):
         self.filename = filename
@@ -77,12 +120,6 @@ class Logger:
 
     def message(self, source, direction, message):
         self.log("MESSAGE", "INFO", source, f"{direction}: {json.dumps(message, separators=(',', ':'))}")
-
-
-def computeCrc(message):
-    body = {key: value for key, value in message.items() if key != "crc"}
-    data = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return zlib.crc32(data)
 
 
 class Server:
@@ -123,7 +160,7 @@ class Server:
 
     def nextSequenceNumber(self):
         with self.lock:
-            self.sequence += 1
+            self.sequence = self.sequence % 65535 + 1
             return self.sequence
 
     def start(self):
@@ -136,18 +173,14 @@ class Server:
         self.keepaliveThread.start()
 
     def send(self, message, destinationAddress):
-        self.socket.sendto(json.dumps(message).encode("utf-8"), destinationAddress)
+        self.socket.sendto(encode(message), destinationAddress)
 
     def receive(self):
         data, address = self.socket.recvfrom(1200)
 
         try:
-            message = json.loads(data.decode("utf-8"))
-            if not isinstance(message, dict):
-                return None, address
-
-            return message, address
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            return decode(data), address
+        except (struct.error, IndexError, ValueError, KeyError):
             return None, address
 
     def run(self):
@@ -163,7 +196,11 @@ class Server:
             if message is None:
                 self.logger.system("WARNING", "SERVER", f"Invalid message from {address}")
                 continue
+
             self.logger.message("SERVER", "Received", message)
+            if not message["crcOk"] and message["type"] != "DATA":
+                self.logger.system("WARNING", "SERVER", f"Damaged {message['type']} from {address} ignored")
+                continue
             try:
                 self.handleMessage(message, address)
             except Exception as error:
@@ -181,14 +218,14 @@ class Server:
     def handleReg(self, message, address):
         sensorType = message.get("sensorType")
         sensorId = message.get("sensorId")
-        if sensorType not in self.SENSOR_FIELDS or not sensorId:
+        if sensorType not in self.SENSOR_FIELDS or sensorId is None:
             self.reply({"type": "REJECT", "ack-for": message.get("sequence"), "reason": "Invalid sensor"}, address)
             return
         with self.lock:
             duplicate = any(s["sensorType"] == sensorType and s["sensorId"] == sensorId
                             for s in self.sessions.values())
             if not duplicate:
-                token = secrets.token_hex(6)
+                token = secrets.randbits(32)
                 self.sessions[token] = {"sensorType": sensorType, "sensorId": sensorId,
                                         "address": address, "lastData": time.monotonic(), "lastValues": None,
                                         "token": token, "SuppressACKs": 0, "recentSequences": deque(maxlen=50),
@@ -199,7 +236,7 @@ class Server:
         if duplicate:
             self.reply({"type": "REJECT", "ack-for": message.get("sequence"), "reason": "Already registered"}, address)
             return
-        self.logger.system("INFO", "SERVER", f"Sensor registered: {sensorType}:{sensorId}, token {token}")
+        self.logger.system("INFO", "SERVER", f"Sensor registered: {sensorType}:{sensorId}, token {token:08x}")
 
         return self.reply({"type": "ACK", "ack-for": message.get("sequence"), "token": token}, address)
 
@@ -208,7 +245,7 @@ class Server:
         with self.lock:
             session = self.sessions.get(message.get("token"))
 
-        if message.get("crc") != computeCrc(message):
+        if not message["crcOk"]:
             name = f"{session['sensorType']}:{session['sensorId']}" if session else str(message.get("sensorId"))
             self.logger.system("WARNING", "SERVER",
                                f"Integrity check failed for {name} retransmission requested")
@@ -220,7 +257,7 @@ class Server:
             return
 
         if message.get("sensorId") != session["sensorId"]:
-            self.reply({"type": "REJECT", "ack-for": sequence, "reason": "token doesn't match sensor Id"}, address)
+            self.reply({"type": "REJECT", "ack-for": sequence, "reason": "Token does not match sensor"}, address)
             return
 
         fields = self.SENSOR_FIELDS[session["sensorType"]]

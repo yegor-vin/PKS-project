@@ -4,7 +4,6 @@ import json
 from datetime import timezone, datetime
 import threading
 import random
-import zlib
 import time
 import math, struct, binascii
 
@@ -38,6 +37,49 @@ def unpack_values(sensorType, data):
         raw = acc & ((1 << w) - 1); acc >>= w
         out[name] = round(low + raw / 10 ** dec, dec) if dec else int(low + raw)
     return dict(reversed(list(out.items())))
+
+
+def encode(m):
+    t = TYPES.index(m["type"])
+    st = SENSOR_TYPES.index(m["sensorType"]) if "sensorType" in m else 0
+    head = struct.pack("!BH", (t << 5) | (st << 3), m["sequence"])
+
+    if m["type"] == "REGISTER":
+        body = struct.pack("!B", m["sensorId"])
+    elif m["type"] in ("ACK", "RETRANSMIT"):
+        body = struct.pack("!H", m["ack-for"]) + (struct.pack("!I", m["token"]) if "token" in m else b"")
+    elif m["type"] == "REJECT":
+        body = struct.pack("!HB", m["ack-for"], REASONS.index(m["reason"]))
+    elif m["type"] == "KEEPALIVE":
+        body = struct.pack("!IB", m["token"], m["sensorId"])
+    else:
+        body = struct.pack("!IB", m["token"], m["sensorId"]) + pack_values(m["sensorType"], m)
+    frame = head + body
+    return frame + struct.pack("!H", binascii.crc_hqx(frame, 0xFFFF))  # CRC-16 over everything
+
+
+def decode(data):
+    frame, crc = data[:-2], struct.unpack("!H", data[-2:])[0]
+    t, st = TYPES[data[0] >> 5], SENSOR_TYPES[(data[0] >> 3) & 0b11]
+    m = {"type": t, "sequence": struct.unpack("!H", data[1:3])[0],
+    "crcOk": binascii.crc_hqx(frame, 0xFFFF) == crc}
+    body = frame[3:]
+
+    if t == "REGISTER":
+        m.update(sensorType=st, sensorId=body[0])
+    elif t in ("ACK", "RETRANSMIT"):
+        m["ack-for"] = struct.unpack("!H", body[:2])[0]
+        if len(body) == 6: m["token"] = struct.unpack("!I", body[2:6])[0]
+    elif t == "REJECT":
+        a, r = struct.unpack("!HB", body);
+        m.update({"ack-for": a, "reason": REASONS[r]})
+    elif t == "KEEPALIVE":
+        m["token"], m["sensorId"] = struct.unpack("!IB", body)
+    else:
+        m["token"], m["sensorId"] = struct.unpack("!IB", body[:5])
+        m["sensorType"] = st
+        m.update(unpack_values(st, body[5:]))
+    return m
 
 
 class Logger:
@@ -127,20 +169,13 @@ class Sensor:
     def dataMessage(self, sequence, values=None):
         if values is None:
             values = self.generateValues()
-        message = {"type": "DATA", "sequence": sequence, "sensorId": self.sensorId, "token": self.token}
+        message = {"type": "DATA", "sequence": sequence, "sensorType": self.sensorType, "sensorId": self.sensorId, "token": self.token}
         message.update(values)
-        message["crc"] = computeCrc(message)
         return message
 
 
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 5500
-
-
-def computeCrc(message):
-    body = {key: value for key, value in message.items() if key != "crc"}
-    data = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return zlib.crc32(data)
 
 
 class Client:
@@ -179,7 +214,7 @@ class Client:
 
     def nextSequenceNumber(self):
         with self.lock:
-            self.sequence += 1
+            self.sequence = self.sequence % 65535 + 1
             return self.sequence
 
     def setServer(self, serverIp, serverPort):
@@ -247,7 +282,7 @@ class Client:
             return
 
         if original["type"] == "REGISTER":
-            if replyType == "ACK" and reply.get("token"):
+            if replyType == "ACK" and "token" in reply:
                 sensor.token = reply["token"]
                 sensor.lastHeard = time.monotonic()
                 self.logger.system("INFO", sensor.source(), f"Registered, token {sensor.token}")
@@ -288,26 +323,25 @@ class Client:
 
     def transmit(self, entry, label):
         sensor, message = entry["sensor"], entry["message"]
-        wire = message
+        wire = encode(message)
         if message["type"] == "DATA" and sensor.corruptNext:
             sensor.corruptNext = False
-            wire = self.corrupt(sensor, message)
+            wire = self.corrupt(sensor, message, wire)
             label += " (CORRUPTED)"
         try:
-            self.send(wire, self.server)
+            self.socket.sendto(wire, self.server)
         except OSError as error:
             self.logger.system("ERROR", sensor.source(), f"Send failed: {error}")
             return
 
-        self.logger.message(sensor.source(), label, wire)
+        self.logger.message(sensor.source(), label, message)
 
-    def corrupt(self, sensor, message):
-        wire = dict(message)
-        name, low, high, decimals = sensorSpecification[sensor.sensorType][0]
-        wire[name] = round(wire[name] + 1, decimals) if decimals else wire[name] + 1
+    def corrupt(self, sensor, message, wire):
+        damaged = bytearray(wire)
+        damaged[8] ^= 0x01
         self.logger.system("WARNING", sensor.source(),
-                           f"Error injected into DATA {message['sequence']}: {name} {message[name]} -> {wire[name]}")
-        return wire
+                           f"Error injected into DATA {message['sequence']}: byte 8 {wire[8]:02x} -> {damaged[8]:02x}")
+        return bytes(damaged)
 
     def injectError(self, sensor):
         sensor.corruptNext = True
@@ -342,19 +376,18 @@ class Client:
                                f"{self.MAX_ATTEMPTS} attempts, message dropped")
 
     def send(self, message, destinationAddress):
-        self.socket.sendto(json.dumps(message).encode("utf-8"), destinationAddress)
+        self.socket.sendto(encode(message), destinationAddress)
 
     def receive(self):
         data, address = self.socket.recvfrom(1200)
 
         try:
-            message = json.loads(data.decode("utf-8"))
-            if not isinstance(message, dict):
-                return None, address
-
-            return message, address
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            message = decode(data)
+        except (struct.error, IndexError, ValueError, KeyError):
             return None, address
+        if not message["crcOk"]:
+            return None, address
+        return message, address
 
     def toggleSending(self, sensor):
         sensor.send = not sensor.send
@@ -372,8 +405,7 @@ class Client:
             return
         sensor.lastHeard = time.monotonic()
         self.logger.message(sensor.source(), "Received", keepalive)
-        ack = {"type": "ACK", "sequence": self.nextSequenceNumber(), "ack-for": keepalive.get("sequence"),
-               "sensorId": sensor.sensorId, "token": sensor.token}
+        ack = {"type": "ACK", "sequence": self.nextSequenceNumber(), "ack-for": keepalive.get("sequence"), "token": sensor.token}
         try:
             self.send(ack, self.server)
         except OSError as error:
@@ -457,10 +489,10 @@ def askSensorType():
 
 def askSensorId():
     while True:
-        text = ask("Sensor ID (e.g. T-01): ")
-        if text and len(text) <= 16 and " " not in text:
-            return text
-        print("ID must be 1-16 characters without spaces.")
+        text = ask("Sensor ID (1-255): ")
+        if text.isdigit() and 1 <= int(text) <= 255:
+            return int(text)
+        print("ID must be a number from 1 to 255.")
 
 
 def chooseSensor(client, onlyRegistered=True):
@@ -522,7 +554,7 @@ def main():
         print(f"\n=== TESTER - server {client.server[0]}:{client.server[1]} ===")
         print("1) Set server IP and port")
         print("2) Register sensor")
-        print("3) Register one sensor of each type (T-01, W-01, R-01, A-01)")
+        print("3) Register one sensor of each type (ID 1)")
         print("4) Show sensors")
         print("5) Turn automatic sending on/off for a sensor")
         print("6) Send custom data")
@@ -550,8 +582,8 @@ def main():
                     print(client.register(sensorType, sensorId))
 
                 case 3:
-                    for sensorType, sensorId in (("ThermoNode", "T-01"), ("WindSense", "W-01"),
-                                                 ("RainDetect", "R-01"), ("AirQuality", "A-01")):
+                    for sensorType, sensorId in (("ThermoNode", 1), ("WindSense", 1),
+                                                 ("RainDetect", 1), ("AirQuality", 1)):
                         print(client.register(sensorType, sensorId))
 
                 case 4:
