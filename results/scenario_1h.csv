@@ -1,0 +1,7 @@
+protocol,frames,l2_total_B,l2_total_kB,sensor_sent_kB,vs_json_poc_%
+JSON PoC,2888,446066,446.1,311.1,100.0
+Binary,2888,184832,184.8,92.4,41.4
+MQTT + JSON,4344,446123,446.1,339.0,100.0
+MQTT + binary,4344,356823,356.8,249.7,80.0
+CoAP + JSON,2880,300260,300.3,208.1,67.3
+CoAP + binary,2880,210960,211.0,118.8,47.3

@@ -1,0 +1,97 @@
+sensor,protocol,message,app_min,app_max,app_avg,with_udp_tcp,with_ip,l2_frame
+ThermoNode,JSON PoC,REGISTER,85,86,85.9,93.9,113.9,131.9
+ThermoNode,JSON PoC,ACK (register),73,75,74.8,82.8,102.8,120.8
+ThermoNode,JSON PoC,DATA,173,179,176.3,184.3,204.3,222.3
+ThermoNode,JSON PoC,ACK (data),48,50,49.8,57.8,77.8,95.8
+ThermoNode,JSON PoC,KEEPALIVE,83,84,83.9,91.9,111.9,129.9
+ThermoNode,JSON PoC,ACK (keepalive),93,95,94.8,102.8,122.8,140.8
+ThermoNode,JSON PoC,RETRANSMIT,55,57,56.8,64.8,84.8,102.8
+ThermoNode,JSON PoC,REJECT,78,80,79.8,87.8,107.8,125.8
+ThermoNode,Binary,REGISTER,6,6,6,14,34,64
+ThermoNode,Binary,ACK (register),11,11,11,19,39,64
+ThermoNode,Binary,DATA,16,16,16,24,44,64
+ThermoNode,Binary,ACK (data),7,7,7,15,35,64
+ThermoNode,Binary,KEEPALIVE,10,10,10,18,38,64
+ThermoNode,Binary,ACK (keepalive),11,11,11,19,39,64
+ThermoNode,Binary,RETRANSMIT,7,7,7,15,35,64
+ThermoNode,Binary,REJECT,8,8,8,16,36,64
+ThermoNode,CoAP + JSON,DATA,101,106,103.7,111.7,131.7,149.7
+ThermoNode,CoAP + JSON,ACK (data),6,6,6,14,34,64
+ThermoNode,CoAP + binary,DATA,38,38,38,46,66,84
+ThermoNode,CoAP + binary,ACK (data),6,6,6,14,34,64
+ThermoNode,MQTT + JSON,DATA,97,102,99.7,131.7,151.7,169.7
+ThermoNode,MQTT + JSON,ACK (data),4,4,4,36,56,74
+ThermoNode,MQTT + binary,DATA,34,34,34,66,86,104
+ThermoNode,MQTT + binary,ACK (data),4,4,4,36,56,74
+WindSense,JSON PoC,REGISTER,84,85,84.9,92.9,112.9,130.9
+WindSense,JSON PoC,ACK (register),73,75,74.7,82.7,102.7,120.7
+WindSense,JSON PoC,DATA,175,179,178.1,186.1,206.1,224.1
+WindSense,JSON PoC,ACK (data),48,50,49.7,57.7,77.7,95.7
+WindSense,JSON PoC,KEEPALIVE,83,84,83.9,91.9,111.9,129.9
+WindSense,JSON PoC,ACK (keepalive),93,95,94.7,102.7,122.7,140.7
+WindSense,JSON PoC,RETRANSMIT,55,57,56.7,64.7,84.7,102.7
+WindSense,JSON PoC,REJECT,78,80,79.7,87.7,107.7,125.7
+WindSense,Binary,REGISTER,6,6,6,14,34,64
+WindSense,Binary,ACK (register),11,11,11,19,39,64
+WindSense,Binary,DATA,14,14,14,22,42,64
+WindSense,Binary,ACK (data),7,7,7,15,35,64
+WindSense,Binary,KEEPALIVE,10,10,10,18,38,64
+WindSense,Binary,ACK (keepalive),11,11,11,19,39,64
+WindSense,Binary,RETRANSMIT,7,7,7,15,35,64
+WindSense,Binary,REJECT,8,8,8,16,36,64
+WindSense,CoAP + JSON,DATA,103,105,104.4,112.4,132.4,150.4
+WindSense,CoAP + JSON,ACK (data),6,6,6,14,34,64
+WindSense,CoAP + binary,DATA,35,35,35,43,63,81
+WindSense,CoAP + binary,ACK (data),6,6,6,14,34,64
+WindSense,MQTT + JSON,DATA,99,101,100.4,132.4,152.4,170.4
+WindSense,MQTT + JSON,ACK (data),4,4,4,36,56,74
+WindSense,MQTT + binary,DATA,31,31,31,63,83,101
+WindSense,MQTT + binary,ACK (data),4,4,4,36,56,74
+RainDetect,JSON PoC,REGISTER,84,86,85.9,93.9,113.9,131.9
+RainDetect,JSON PoC,ACK (register),71,75,74.8,82.8,102.8,120.8
+RainDetect,JSON PoC,DATA,174,178,177.2,185.2,205.2,223.2
+RainDetect,JSON PoC,ACK (data),46,50,49.8,57.8,77.8,95.8
+RainDetect,JSON PoC,KEEPALIVE,82,84,83.9,91.9,111.9,129.9
+RainDetect,JSON PoC,ACK (keepalive),91,95,94.8,102.8,122.8,140.8
+RainDetect,JSON PoC,RETRANSMIT,53,57,56.8,64.8,84.8,102.8
+RainDetect,JSON PoC,REJECT,76,80,79.8,87.8,107.8,125.8
+RainDetect,Binary,REGISTER,6,6,6,14,34,64
+RainDetect,Binary,ACK (register),11,11,11,19,39,64
+RainDetect,Binary,DATA,14,14,14,22,42,64
+RainDetect,Binary,ACK (data),7,7,7,15,35,64
+RainDetect,Binary,KEEPALIVE,10,10,10,18,38,64
+RainDetect,Binary,ACK (keepalive),11,11,11,19,39,64
+RainDetect,Binary,RETRANSMIT,7,7,7,15,35,64
+RainDetect,Binary,REJECT,8,8,8,16,36,64
+RainDetect,CoAP + JSON,DATA,102,105,104.5,112.5,132.5,150.5
+RainDetect,CoAP + JSON,ACK (data),6,6,6,14,34,64
+RainDetect,CoAP + binary,DATA,36,36,36,44,64,82
+RainDetect,CoAP + binary,ACK (data),6,6,6,14,34,64
+RainDetect,MQTT + JSON,DATA,98,101,100.5,132.5,152.5,170.5
+RainDetect,MQTT + JSON,ACK (data),4,4,4,36,56,74
+RainDetect,MQTT + binary,DATA,32,32,32,64,84,102
+RainDetect,MQTT + binary,ACK (data),4,4,4,36,56,74
+AirQuality,JSON PoC,REGISTER,84,86,85.9,93.9,113.9,131.9
+AirQuality,JSON PoC,ACK (register),71,75,74.8,82.8,102.8,120.8
+AirQuality,JSON PoC,DATA,150,153,152.1,160.1,180.1,198.1
+AirQuality,JSON PoC,ACK (data),46,50,49.8,57.8,77.8,95.8
+AirQuality,JSON PoC,KEEPALIVE,82,84,83.9,91.9,111.9,129.9
+AirQuality,JSON PoC,ACK (keepalive),91,95,94.8,102.8,122.8,140.8
+AirQuality,JSON PoC,RETRANSMIT,53,57,56.8,64.8,84.8,102.8
+AirQuality,JSON PoC,REJECT,76,80,79.8,87.8,107.8,125.8
+AirQuality,Binary,REGISTER,6,6,6,14,34,64
+AirQuality,Binary,ACK (register),11,11,11,19,39,64
+AirQuality,Binary,DATA,15,15,15,23,43,64
+AirQuality,Binary,ACK (data),7,7,7,15,35,64
+AirQuality,Binary,KEEPALIVE,10,10,10,18,38,64
+AirQuality,Binary,ACK (keepalive),11,11,11,19,39,64
+AirQuality,Binary,RETRANSMIT,7,7,7,15,35,64
+AirQuality,Binary,REJECT,8,8,8,16,36,64
+AirQuality,CoAP + JSON,DATA,80,82,81.5,89.5,109.5,127.5
+AirQuality,CoAP + JSON,ACK (data),6,6,6,14,34,64
+AirQuality,CoAP + binary,DATA,37,37,37,45,65,83
+AirQuality,CoAP + binary,ACK (data),6,6,6,14,34,64
+AirQuality,MQTT + JSON,DATA,76,78,77.5,109.5,129.5,147.5
+AirQuality,MQTT + JSON,ACK (data),4,4,4,36,56,74
+AirQuality,MQTT + binary,DATA,33,33,33,65,85,103
+AirQuality,MQTT + binary,ACK (data),4,4,4,36,56,74

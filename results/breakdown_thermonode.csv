@@ -1,0 +1,7 @@
+protocol,data,app_header,transport_ip,ethernet,frame,app,data_share_app_%,data_share_frame_%,useful_bits_share_frame_%
+JSON PoC,77,100,28,18,223,177,43.5,34.5,2.6
+Binary,6,10,28,20,64,16,37.5,9.4,9.2
+CoAP + JSON,72,32,28,18,150,104,69.2,48.0,3.9
+CoAP + binary,6,32,28,18,84,38,15.8,7.1,7.0
+MQTT + JSON,72,28,52,18,170,100,72.0,42.4,3.5
+MQTT + binary,6,28,52,18,104,34,17.6,5.8,5.6
