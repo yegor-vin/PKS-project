@@ -201,76 +201,6 @@ def breakdown(t, rng):
     return rows
 
 
-def scenario(t, rng, hours=1.0, interval=10, idle=False):
-    duration = int(hours * 3600)
-    per_sensor = 0 if idle else duration // interval
-    keepalives_ours = 0 if not idle else (duration - 15) // 5 + 1
-    mqtt_pings = 0 if not idle else duration // 60
-    results = {}
-
-    def add(proto, frames, up, total_frames=1):
-        r = results.setdefault(proto, {"frames": 0, "l2_total": 0, "l2_sensor_sent": 0})
-        r["frames"] += total_frames
-        r["l2_total"] += frames
-        r["l2_sensor_sent"] += up
-
-    for st in t.SENSOR_TYPES:
-        sensor = t.Sensor(st, 1)
-        topic = f"fiitmeteo/{st}/1"
-        tok = b"\x12\x34"
-
-        for proto, msgs in (("JSON PoC", json_messages(st, sensor.generateValues(), 1)),
-                            ("Binary", binary_messages(t, st, sensor.generateValues(), 1))):
-            enc = json_poc if proto == "JSON PoC" else t.encode
-            up, down = l2_frame(len(enc(msgs["REGISTER"])), UDP), l2_frame(len(enc(msgs["ACK (register)"])), UDP)
-            add(proto, up + down, up, 2)
-        syn, synack, ack = l2_frame(0, TCP_SYN), l2_frame(0, TCP_SYN), l2_frame(0, TCP)
-        conn, connack = l2_frame(len(mqtt_connect(f"{st}-1")), TCP), l2_frame(len(MQTT_CONNACK), TCP)
-        for proto in ("MQTT + JSON", "MQTT + binary"):
-            add(proto, syn + synack + ack + conn + connack + ack, syn + ack + conn + ack, 6)
-        results.setdefault("CoAP + JSON", {"frames": 0, "l2_total": 0, "l2_sensor_sent": 0})
-        results.setdefault("CoAP + binary", {"frames": 0, "l2_total": 0, "l2_sensor_sent": 0})
-
-        for i in range(per_sensor):
-            values, seq = sensor.generateValues(), (i % 9999) + 1
-            m = json_messages(st, values, seq)
-            up, down = l2_frame(len(json_poc(m["DATA"])), UDP), l2_frame(len(json_poc(m["ACK (data)"])), UDP)
-            add("JSON PoC", up + down, up, 2)
-            b = binary_messages(t, st, values, seq)
-            up, down = l2_frame(len(t.encode(b["DATA"])), UDP), l2_frame(len(t.encode(b["ACK (data)"])), UDP)
-            add("Binary", up + down, up, 2)
-            packed, vjson = t.pack_values(st, values), values_json(values)
-            for proto, payload, cf in (("CoAP + JSON", vjson, 50), ("CoAP + binary", packed, 42)):
-                up, down = l2_frame(len(coap_post(topic, payload, cf, seq, tok)), UDP), l2_frame(len(coap_ack(seq, tok)), UDP)
-                add(proto, up + down, up, 2)
-            for proto, payload in (("MQTT + JSON", vjson), ("MQTT + binary", packed)):
-
-                up, down = l2_frame(len(mqtt_publish(topic, payload, seq)), TCP), l2_frame(len(mqtt_puback(seq)), TCP)
-                add(proto, up + down + ack, up + ack, 3)
-
-        for _ in range(keepalives_ours):
-            m = json_messages(st, {}, 1)
-            add("JSON PoC", l2_frame(len(json_poc(m["KEEPALIVE"])), UDP) + l2_frame(len(json_poc(m["ACK (keepalive)"])), UDP),
-                l2_frame(len(json_poc(m["ACK (keepalive)"])), UDP), 2)
-            b = binary_messages(t, st, sensor.generateValues(), 1)
-            add("Binary", l2_frame(len(t.encode(b["KEEPALIVE"])), UDP) + l2_frame(len(t.encode(b["ACK (keepalive)"])), UDP),
-                l2_frame(len(t.encode(b["ACK (keepalive)"])), UDP), 2)
-        for _ in range(mqtt_pings):
-            ping, pong = l2_frame(len(MQTT_PINGREQ), TCP), l2_frame(len(MQTT_PINGRESP), TCP)
-            for proto in ("MQTT + JSON", "MQTT + binary"):
-                add(proto, ping + pong + ack, ping + ack, 3)
-
-    rows = []
-    for proto, r in results.items():
-        rows.append({"protocol": proto, "frames": r["frames"], "l2_total_B": r["l2_total"],
-                     "l2_total_kB": round(r["l2_total"] / 1000, 1),
-                     "sensor_sent_kB": round(r["l2_sensor_sent"] / 1000, 1)})
-    base = next(r["l2_total_B"] for r in rows if r["protocol"] == "JSON PoC")
-    for r in rows:
-        r["vs_json_poc_%"] = round(100 * r["l2_total_B"] / base, 1) if base else None
-    return rows
-
-
 def write_pcap(t, path):
     def ip(proto, src, dst, payload):
         h = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), 0, 0x4000, 64, proto, 0,
@@ -337,7 +267,7 @@ def style(ax):
     ax.set_axisbelow(True)
 
 
-def charts(per_msg, brk, scen, scen_idle, out):
+def charts(per_msg, brk, out):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -382,21 +312,6 @@ def charts(per_msg, brk, scen, scen_idle, out):
     fig.tight_layout(); fig.savefig(os.path.join(out, "chart_breakdown.png"), dpi=200); plt.close(fig)
 
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 3.6))
-    for ax, rows, title in ((axes[0], scen, "Data every 10 s"), (axes[1], scen_idle, "Idle (liveness check only)")):
-        vals = [next(r["l2_total_kB"] for r in rows if r["protocol"] == p) for p in order]
-        bars = ax.barh(order, vals, color=[BLUE if p == "Binary" else MUTED for p in order], height=0.6)
-        for b, v in zip(bars, vals):
-            label = f"{v:.1f} kB" if v else "0 (no liveness check)"
-            ax.text(v + max(vals) * 0.01, b.get_y() + b.get_height() / 2, label, va="center",
-                    color=INK if v else INK2, fontsize=9)
-        ax.set_title(title, color=INK, loc="left", fontsize=10)
-        ax.invert_yaxis(); style(ax); ax.set_xlim(0, max(vals) * 1.25 if max(vals) else 1)
-        ax.set_xlabel("kB on Ethernet, both directions", color=INK2)
-    fig.suptitle("1 hour, 4 sensors (one of each type)", color=INK, x=0.01, ha="left", fontsize=11)
-    fig.tight_layout(); fig.savefig(os.path.join(out, "chart_scenario.png"), dpi=200); plt.close(fig)
-
-
 def write_csv(rows, path):
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
@@ -426,13 +341,9 @@ def main():
 
     per_msg = per_message_table(t, args.samples, rng)
     brk = breakdown(t, rng)
-    scen = scenario(t, rng)
-    scen_idle = scenario(t, rng, idle=True)
 
     write_csv(per_msg, os.path.join(args.out, "per_message.csv"))
     write_csv(brk, os.path.join(args.out, "breakdown_thermonode.csv"))
-    write_csv(scen, os.path.join(args.out, "scenario_1h.csv"))
-    write_csv(scen_idle, os.path.join(args.out, "scenario_1h_idle.csv"))
     write_pcap(t, os.path.join(args.out, "measurement.pcap"))
 
     ours = [r for r in per_msg if r["protocol"] in ("JSON PoC", "Binary")]
@@ -459,16 +370,10 @@ def main():
           md_table(brk, ["protocol", "data", "app_header", "app", "transport_ip", "ethernet", "frame",
                          "data_share_app_%", "data_share_frame_%"],
                    ["Protocol", "Values [B]", "App header [B]", "App total [B]", "UDP/TCP+IP [B]",
-                    "Ethernet [B]", "Frame [B]", "Values / app", "Values / frame"]), "",
-          "## 3. One hour, 4 sensors, data every 10 s", "",
-          md_table(scen, list(scen[0]), ["Protocol", "Frames", "Total [B]", "Total [kB]", "Sent by sensors [kB]",
-                                         "vs. JSON PoC"]), "",
-          "## 4. One hour, 4 sensors, idle (liveness check only)", "",
-          md_table(scen_idle, list(scen_idle[0]), ["Protocol", "Frames", "Total [B]", "Total [kB]",
-                                                   "Sent by sensors [kB]", "vs. JSON PoC"]), ""]
+                    "Ethernet [B]", "Frame [B]", "Values / app", "Values / frame"]), ""]
     with open(os.path.join(args.out, "tables.md"), "w") as f:
         f.write("\n".join(md))
-    charts(per_msg, brk, scen, scen_idle, args.out)
+    charts(per_msg, brk, args.out)
     print("\n".join(md))
     print(f"\nFiles written to {args.out}")
 
