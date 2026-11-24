@@ -5,7 +5,6 @@ from datetime import timezone, datetime
 import threading
 import secrets
 import time
-import zlib
 from collections import deque
 import math, struct, binascii
 
@@ -64,10 +63,10 @@ def encode(m):
         body = struct.pack("!HB", m["ack-for"], REASONS.index(m["reason"]))
     elif m["type"] == "KEEPALIVE":
         body = struct.pack("!IB", m["token"], m["sensorId"])
-    else:  # DATA
+    else:
         body = struct.pack("!IB", m["token"], m["sensorId"]) + pack_values(m["sensorType"], m)
     frame = head + body
-    return frame + struct.pack("!H", binascii.crc_hqx(frame, 0xFFFF))  # CRC-16 over everything
+    return frame + struct.pack("!H", binascii.crc_hqx(frame, 0xFFFF))
 
 
 def decode(data):
